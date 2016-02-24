@@ -23,7 +23,12 @@ class ContestPeriod
   FORMAT3 = /^\W*\s*(\d{4})\s+local,\s+#{MONTH_REGEX}\s+(\d{1,2})\s+to\s+(\d{4})\s+local,\s+#{MONTH_REGEX}\s+(\d{1,2})(.*)/i #2000 local, Jul 4 to 0200 local, Jul 5
   # 1900 local - 2300 local, sep 29]
   FORMAT4 = /^\W*\s*(\d{4})\s+local\s+-\s+(\d{4})\s+local,\s+#{MONTH_REGEX}\s+(\d{1,2})(.*)/i
-  #
+  #   1500-1700Z, Nov 15 (80m)
+  FORMAT5 = /^\W*\s*(\d{4})\s*[zZ]?\s*-\s*(\d{4})\s*[zZ],\s+#{MONTH_REGEX}\s+(\d{1,2})(.*)/i
+  #                                                         Cannot parse [1300-1500Z, Nov 15 (40m)]
+
+  FORMAT6 =  /^\W*\s*(\d{4})\s*[zZ]?\s*-\s*(\d{4})\s*([zZ]|local)?,\s+#{MONTH_REGEX}\s+(\d{1,2})(.*)/i  #[0800-1400 local, May 7]
+
   def initialize(string_to_parse)
     self.original_period = string_to_parse
     # handle 0000z-2400z, Jul 10 (CW)
@@ -41,7 +46,20 @@ class ContestPeriod
     month_number += 1
   end
 
-
+  # adjust the year for the contest month value
+  # if year is Nov or Dec, and month is 0 - 4, use next year
+  def adjusted_year_for_month(contest_month)
+    now_month_index = Time.now.month - 1
+    contest_month_index = MONTHS_ARY.find_index(contest_month.downcase)
+    if contest_month_index < 0
+      raise Exception.new("Month #{contest_month} not valid!")
+    end
+    adjusted_year = Time.now.year
+    if now_month_index >= 10 && (contest_month_index.between?(0, 9)) #
+      adjusted_year = adjusted_year + 1
+    end
+    adjusted_year
+  end
 
   def interpret_time(time_specifier)
     #
@@ -59,8 +77,7 @@ class ContestPeriod
       end_month = m[3]
       start_day = m[4]
       end_day = m[4]
-      start_year = Time.now.year
-      end_year = Time.now.year
+
       self.extra_info = m[7]
 
     elsif ((m = FORMAT2.match(lwr_date)) || (m = FORMAT3.match(lwr_date)))
@@ -72,10 +89,8 @@ class ContestPeriod
       end_month = m[5]
       start_day = m[3]
       end_day = m[6]
-      start_year = Time.now.year
-      end_year = Time.now.year
       self.extra_info = m[7]
-    elsif (m = FORMAT4.match(lwr_date))
+    elsif ((m = FORMAT4.match(lwr_date)) || (m = FORMAT5.match(lwr_date)))
       # #<MatchData "1900 local - 2300 local, sep 29" 1:"1900" 2:"2300" 3:"sep" 4:"29">
       start_hm = m[1]
       end_hm = m[2]
@@ -83,9 +98,16 @@ class ContestPeriod
       end_month = m[3]
       start_day = m[4]
       end_day = m[4]
-      start_year = Time.now.year
-      end_year = Time.now.year
       self.extra_info = m[5]
+    elsif (m = FORMAT6.match(lwr_date))
+          # #<MatchData "1900 local - 2300 local, sep 29" 1:"1900" 2:"2300" 3:"sep" 4:"29">
+          start_hm = m[1]
+          end_hm = m[2]
+          start_month = m[4]
+          end_month = m[4]
+          start_day = m[5]
+          end_day = m[5]
+          self.extra_info = m[6]
     else
       # Cannot parse it
       puts "\n\nCannot parse [#{lwr_date}]\n\n"
@@ -94,10 +116,15 @@ class ContestPeriod
 
     start_month_number = month_number_for_word(start_month)
     end_month_number = month_number_for_word(end_month)
+
     if start_month_number.nil? || end_month_number.nil?
       puts "Invalid month"
       return
     end
+
+    start_year = adjusted_year_for_month(start_month)
+    end_year = adjusted_year_for_month(end_month)
+
     # make into this format 1985-04-12T23:20:50.52Z to parse with RFC3339 format
     #                       2015-04-07T::00.00Z
     #puts "Start hm #{start_hm}"
@@ -111,6 +138,10 @@ class ContestPeriod
   end
 
   def start_in_period(start_time, end_time)
+    if self.start_time.nil?
+      puts "Start time is nil!!!!"
+      puts self.inspect
+    end
     (DateTime.parse(start_time) <= self.start_time) && (self.start_time <= DateTime.parse(end_time))
   end
 
@@ -198,7 +229,7 @@ class ContestItemParser
   def times=(the_time)
     @contest_periods = []
     @times = the_time
-    #puts "the_time #{the_time.inspect}"
+    puts "the_time #{the_time.inspect}"
     @contest_periods = the_time.map{|tv|
        #ContestPeriod.new(tv)
       ContestPeriod.interpret_original_period(tv)
@@ -227,6 +258,9 @@ class ContestFragmentParser
   attr_accessor :end_date
 
   def initialize(filename)
+    if filename.nil?
+      filename = "http://www.hornucopia.com/contestcal/contestcal.html"
+    end
     if filename.downcase.match(/^http/)
       @doc = Nokogiri::HTML(open(filename))
       @page_url = filename
@@ -422,13 +456,31 @@ class ContestFragmentParser
 end
 
 class ContestReport
-  def self.run!(input_file, output_file_root, start_date_s, end_date_s=nil)
-    start_date = DateTime.parse(start_date_s).to_s
+  def self.date_of_next(day)
+    date  = Date.parse(day)
+    delta = date > Date.today ? 0 : 7
+    date + delta
+  end
+
+  def self.run!(input_file=nil, output_file_root=nil, start_date_s=nil, end_date_s=nil)
+    if start_date_s.nil?
+      #
+      start_date = self.date_of_next("Thursday").to_s
+    else
+      start_date = DateTime.parse(start_date_s).to_s
+    end
+
+    if output_file_root.nil?
+      output_file_root = "/tmp/cr_#{DateTime.parse(start_date).strftime('%F')}"
+    end
+
     if end_date_s.nil?
       end_date = (DateTime.parse(start_date) + 13 + Rational(86399, 86400) ).to_s
     else
       end_date = DateTime.parse(end_date_s).to_s
     end
+    puts "Start Date is #{start_date}"
+    puts "End Date is   #{end_date}"
     cfd = ContestFragmentParser.new(input_file)
     cfd.start_date = start_date
     cfd.end_date = end_date
@@ -501,4 +553,5 @@ class ContestLogsDueParser
   # el2.parent.parent.css("td span:contains('Find rules at:')").first.parent.next
   # el2 =  parel.next.next.next.next.next.next.next.next
   # el2.css("td span:contains('Find rules at:')").first.parent.next
-end
+  end
+puts "you probably want ContestReport.run!"
