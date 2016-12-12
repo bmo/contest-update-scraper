@@ -17,6 +17,7 @@ class ContestPeriod
   FORMAT_AND_1 = /((\d{4})[zZ]\-(\d{4})[zZ]\s+and)+/mi
   #FORMAT_AND_ALL = /(#{FORMAT_AND_1}+)\s+#{TIME_RANGE_FORMAT},\s+#{MONTH_REGEX}+(\d{1,2})(.*)/i
   FORMAT_END = /(\d{4})[zZ]\-(\d{4})[zZ],\s+#{MONTH_REGEX}\s+(\d{1,2})/i
+
   FORMAT1 = /^\W*\s*(\d{4})[zZ]\-(\d{4})[zZ],\s+#{MONTH_REGEX}\s+(\d{1,2})(,\s+(\d{4}))*(.*)/i  # 0200z-0300z, Jul 10
   FORMAT2 = /^\W*\s*(\d{4})[zZ],\s+#{MONTH_REGEX}\s+(\d{1,2})\s+to\s+(\d{4})[zZ],\s+#{MONTH_REGEX}\s+(\d{1,2})(.*)/i  #1500Z, Jul 4 to 1500Z, Jul 5
   #
@@ -28,6 +29,9 @@ class ContestPeriod
   #                                                         Cannot parse [1300-1500Z, Nov 15 (40m)]
 
   FORMAT6 =  /^\W*\s*(\d{4})\s*[zZ]?\s*-\s*(\d{4})\s*([zZ]|local)?,\s+#{MONTH_REGEX}\s+(\d{1,2})(.*)/i  #[0800-1400 local, May 7]
+
+  # 0600Z Aug 27 to 0559Z, Aug 28
+  FORMAT7 = /^\W*\s*(\d{4})[zZ]\s+#{MONTH_REGEX}\s+(\d{1,2})\s+to\s+(\d{4})[zZ][,]?\s++#{MONTH_REGEX}\s+(\d{1,2})(.*)/i  # 0200z-0300z, Jul 10
 
   def initialize(string_to_parse)
     self.original_period = string_to_parse
@@ -100,14 +104,23 @@ class ContestPeriod
       end_day = m[4]
       self.extra_info = m[5]
     elsif (m = FORMAT6.match(lwr_date))
-          # #<MatchData "1900 local - 2300 local, sep 29" 1:"1900" 2:"2300" 3:"sep" 4:"29">
-          start_hm = m[1]
-          end_hm = m[2]
-          start_month = m[4]
-          end_month = m[4]
-          start_day = m[5]
-          end_day = m[5]
-          self.extra_info = m[6]
+      # #<MatchData "1900 local - 2300 local, sep 29" 1:"1900" 2:"2300" 3:"sep" 4:"29">
+      start_hm = m[1]
+      end_hm = m[2]
+      start_month = m[3]
+      end_month = m[4]
+      start_day = m[5]
+      end_day = m[5]
+      self.extra_info = m[6]
+    elsif (m = FORMAT7.match(lwr_date))
+      #<MatchData "0600Z Aug 27 to 0559Z, Aug 28" 1:"0600" 2:"Aug" 3:"27" 4:"0559" 5:"Aug" 6:"28" 7:"">
+      start_hm = m[1]
+      end_hm = m[4]
+      start_month = m[2]
+      end_month = m[5]
+      start_day = m[3]
+      end_day =  m[6]
+      self.extra_info = m[7]
     else
       # Cannot parse it
       puts "\n\nCannot parse [#{lwr_date}]\n\n"
@@ -185,11 +198,13 @@ class ContestPeriod
 end
 
 class ContestItemParser
-  attr_reader :doc, :dates, :contest_periods
+  attr_reader :doc, :dates, :contest_periods, :logs_due
   attr_accessor :times
 
-  def initialize(link)
+  def initialize(link, times)
+     # puts "ContentItemParser with #{link}"
      @doc =  Nokogiri::HTML(open(link))
+     self.times = times
   end
 
   def file=(name)
@@ -212,6 +227,14 @@ class ContestItemParser
     @doc.css("div#main td:contains('Bands:') ~ td").text
   end
 
+  def is_vhf_uhf?
+    !bands.scan(/50|70|144|432|1296/).empty? || !bands.scan(/2m|6m|70cm|23cm/).empty? || bands.downcase.match(/uhf|vhf/)
+  end
+
+  def is_hf?
+    !bands.scan(/160|80|40|20|15|10/).empty?
+  end
+
   def exchange
     @doc.css("div#main td:contains('Exchange:') ~ td").children.select(&:text?).join(", ")
   end
@@ -220,10 +243,46 @@ class ContestItemParser
     @doc.css("div#main td:contains('Find rules at:') ~ td").text
   end
 
-  def logs_due
+  # some weekly contests have logs due before the contest start.
+  def fix_weekly_log_due_time
+    old_logs_due = @logs_due
+    while @logs_due < self.contest_periods.last.end_time do
+      @logs_due += 7
+    end
+
+    if old_logs_due != @logs_due
+      puts "Fixed weekly log due date for #{contest_name}: #{old_logs_due} -> #{@logs_due}"
+    end
+  end
+
+  # handle contests with log due dates in a year AFTER the contest date
+  def logs_due_next_year?(log_due)
+    contest_month = self.contest_periods.last.end_time.month
+    (log_due.month < contest_month) && (log_due < self.contest_periods.last.end_time)
+  end
+
+  def logs_due_fixed
+    logs_due_s = logs_due_value
+    return logs_due_s if logs_due_s == "see rules"
+    the_day = DateTime.parse(logs_due_s)
+
+    if logs_due_next_year?(the_day)
+      the_day = the_day.next_year
+      puts "Fixed next-year's log due date for #{contest_name}: to #{the_day.year}"
+    end
+
+    @logs_due ||= DateTime.new(the_day.year, the_day.month, the_day.day, 23, 59, 59)
+
+    fix_weekly_log_due_time
+    @logs_due.strftime("%B %-d")
+  end
+
+  def logs_due_value
     lds_el = @doc.css("div#main td:contains('Logs due:')").first
-    lds = lds_el && lds_el.text.gsub(/^.*Logs due:\s*/,"")
-    (lds && Date.strptime(lds.gsub(/\W*\d{4}Z\-\d{4}Z,\s*/,""), '%b %d').strftime("%B %-d")) || "see rules"
+    #puts lds_el.text
+    lds = lds_el && lds_el.text.gsub(/^.*Logs due:\s*/, "")
+
+    (lds && Date.strptime(lds.gsub(/\W*\d{4}Z\-\d{4}Z,\s*/, ""), '%b %d').strftime("%B %-d")) || "see rules"
   end
 
   def times=(the_time)
@@ -292,8 +351,10 @@ class ContestFragmentParser
         the_link = URI.join(@page_url,the_link).to_s
       end
       puts "Opening #{the_link}"
-      ci = ContestItemParser.new(the_link)
-      ci.times = times(l)
+      some_times = times(l)
+      #puts "TIMES #{some_times.inspect}"
+      ci = ContestItemParser.new(the_link, times(l))
+      #ci.times = times(l)
       @contests << ci
     }
     date_order
@@ -320,49 +381,60 @@ class ContestFragmentParser
     @contests
   end
 
+  def section_with_criteria(doc, section_title=nil)
+    already_shown = []
+    (Date.parse(self.start_date)..Date.parse(self.end_date)).each { |date|
+      #doc.ul {
+      date_key = date.strftime("%B %-d")
+      puts "looking for #{date_key} #{@by_date[date_key] && @by_date[date_key].length}"
+
+      if (section_title)
+        doc.span {
+          doc.text(section_title)
+        }
+      end
+
+      if @by_date[date_key]
+        @by_date[date_key].each { |contest|
+          if !already_shown.include?(contest.hash) && (!block_given? || yield(contest))
+            doc.span {
+              puts contest.hash
+              doc.a(:href => contest.rules_link) {
+                doc.text(contest.contest_name)
+              }
+              doc.text(", ")
+              doc.text(
+                  contest.contest_periods.map { |cp|
+                    cp.to_contest_format
+                  }.join(", ")
+              )
+              doc.text("; ")
+              doc.text(contest.modes)
+              doc.text("; Bands: ")
+              doc.text(contest.bands)
+              doc.text("; ")
+              doc.text(contest.exchange)
+              doc.text("; Logs due: ")
+              doc.text(contest.logs_due_fixed)
+              doc.text(".")
+            }
+            doc.br()
+            already_shown << contest.hash
+          end
+        }
+        #}
+      end
+    }
+  end
+
   def contest_details_for_period
     builder = Nokogiri::HTML::Builder.new do |doc|
       doc.html {
         doc.body() {
           #puts "#{@by_date.keys.inspect}"
-          already_shown = []
-          (Date.parse(self.start_date)..Date.parse(self.end_date)).each { |date|
-            #doc.ul {
-            date_key = date.strftime("%B %-d")
-            puts "looking for #{date_key} #{@by_date[date_key] && @by_date[date_key].length}"
 
-
-            if @by_date[date_key]
-              @by_date[date_key].each { |contest|
-                if !already_shown.include?(contest.hash)
-                  doc.span {
-                    puts contest.hash
-                    doc.a(:href => contest.rules_link) {
-                      doc.text(contest.contest_name)
-                    }
-                    doc.text(", ")
-                    doc.text(
-                        contest.contest_periods.map { |cp|
-                          cp.to_contest_format
-                        }.join(", ")
-                    )
-                    doc.text("; ")
-                    doc.text(contest.modes)
-                    doc.text("; Bands: ")
-                    doc.text(contest.bands)
-                    doc.text("; ")
-                    doc.text(contest.exchange)
-                    doc.text("; Logs due: ")
-                    doc.text(contest.logs_due)
-                    doc.text(".")
-                  }
-                  doc.br()
-                  already_shown << contest.hash
-                end
-              }
-              #}
-            end
-          }
+          section_with_criteria(doc)
+          section_with_criteria(doc,"UHF/VHF"){|c| c.is_uhf_vhf?}
         }
       }
     end
@@ -414,6 +486,9 @@ class ContestFragmentParser
         doc.body() {
           @contests.each { |contest|
             next unless contest.contest_periods.any?{|cp| cp.start_in_period(self.start_date, self.end_date) }
+
+            #contest.fix_log_due_time
+
             doc.span {
               doc.a(:href => contest.rules_link) {
                 doc.text(contest.contest_name)
@@ -431,7 +506,7 @@ class ContestFragmentParser
               doc.text( "; " )
               doc.text(contest.exchange)
               doc.text("; Logs due: ")
-              doc.text(contest.logs_due)
+              doc.text(contest.logs_due_fixed)
               doc.text(".")
 
             }
@@ -462,7 +537,7 @@ class ContestReport
     date + delta
   end
 
-  def self.run!(input_file=nil, output_file_root=nil, start_date_s=nil, end_date_s=nil)
+  def self.run!(start_date_s=nil, end_date_s=nil, input_file=nil, output_file_root=nil)
     if start_date_s.nil?
       #
       start_date = self.date_of_next("Thursday").to_s
@@ -553,5 +628,5 @@ class ContestLogsDueParser
   # el2.parent.parent.css("td span:contains('Find rules at:')").first.parent.next
   # el2 =  parel.next.next.next.next.next.next.next.next
   # el2.css("td span:contains('Find rules at:')").first.parent.next
-  end
+end
 puts "you probably want ContestReport.run!"
