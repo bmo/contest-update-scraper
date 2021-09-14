@@ -8,11 +8,13 @@ require 'open-uri'
 
 
 class ContestPeriod
-  attr_accessor :original_period, :start_time, :end_time, :extra_info, :is_local
+  class DateParseError < StandardError; end
+
+  attr_accessor :original_period, :start_time, :end_time, :extra_info, :is_local, :year
 
   MONTHS = "jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec"
   MONTHS_ARY = MONTHS.split(/\|/)
-  MONTH_REGEX =  "(#{MONTHS})"
+  MONTH_REGEX =  /(#{MONTHS})/
   TIME_RANGE_FORMAT = /(\d{4})[zZ]\-(\d{4})[zZ]/
   FORMAT_AND_1 = /((\d{4})[zZ]\-(\d{4})[zZ]\s+and)+/mi
   #FORMAT_AND_ALL = /(#{FORMAT_AND_1}+)\s+#{TIME_RANGE_FORMAT},\s+#{MONTH_REGEX}+(\d{1,2})(.*)/i
@@ -23,8 +25,9 @@ class ContestPeriod
   #
   FORMAT3 = /^\W*\s*(\d{4})\s+local,\s+#{MONTH_REGEX}\s+(\d{1,2})\s+to\s+(\d{4})\s+local,\s+#{MONTH_REGEX}\s+(\d{1,2})(.*)/i #2000 local, Jul 4 to 0200 local, Jul 5
 
+  #  1900 local-2300 local, Sep 21
   # 1900 local - 2300 local, sep 29]
-  FORMAT4 = /^\W*\s*(\d{4})\s+local\s+-\s+(\d{4})\s+local,\s+#{MONTH_REGEX}\s+(\d{1,2})(.*)/i
+  FORMAT4 = /^\W*\s*(\d{4})\s+local\s*-\s*(\d{4})\s+local,\s+#{MONTH_REGEX}\s+(\d{1,2})(.*)/i
 
   #   1500-1700Z, Nov 15 (80m)
   FORMAT5 = /^\W*\s*(\d{4})\s*[zZ]?\s*-\s*(\d{4})\s*[zZ],\s+#{MONTH_REGEX}\s+(\d{1,2})(.*)/i
@@ -41,10 +44,14 @@ class ContestPeriod
   #   1400Z to 2400Z, Oct 14
   FORMAT9 = /^\W*\s*(\d{4})\s*[zZ]?\s*to\s*(\d{4})\s*[zZ],\s+#{MONTH_REGEX}\s+(\d{1,2})(.*)/i
 
-
-  def initialize(string_to_parse)
+  # "Feb 22, 2022"
+  FORMAT10 =/#{MONTH_REGEX}\s+(\d{1,2}),\s+(20\d\d)/i
+  
+  def initialize(string_to_parse, year)
+    puts "ContestPeriod: <<< #{string_to_parse} >>> YEAR #{year}"
     string_to_parse = string_to_parse.gsub("june","jun")
     self.original_period = string_to_parse
+    self.year = year.to_i
     # handle 0000z-2400z, Jul 10 (CW)
     # 0000Z, Jul 4 to 2359Z, Jul 5
     # "1400Z, June 2 to 0200Z, Jun 3"
@@ -70,15 +77,15 @@ class ContestPeriod
     if contest_month_index < 0
       raise Exception.new("Month #{contest_month} not valid!")
     end
-    adjusted_year = Time.now.year
+    adjusted_year = self.year
     if now_month_index >= 10 && (contest_month_index.between?(0, 9)) #
-      adjusted_year = adjusted_year + 1
+      adjusted_year = adjusted_year # + 1
     end
     adjusted_year
   end
 
   def interpret_time(time_specifier)
-    #
+    time_specifier.downcase!
     lwr_date = time_specifier.gsub("june", "jun")
     self.is_local = false
     # handle conjunctions
@@ -97,6 +104,7 @@ class ContestPeriod
       self.extra_info = m[7]
 
     elsif (m = FORMAT2.match(lwr_date)) || (m = FORMAT3.match(lwr_date))
+      #<MatchData "0800Z, Oct 1 to 2000Z, Oct 7" 1:"0800" 2:"Oct" 3:"1" 4:"2000" 5:"Oct" 6:"7" 7:"">
       self.is_local = !(FORMAT3.match(lwr_date).nil?)   # if it matched it's local time
       # #<MatchData "1500Z, Jul 4 to 1500Z, Jul 5" 1:"1500" 2:"Jul" 3:"4" 4:"1500" 5:"Jul" 6:"5">
       start_hm = m[1]
@@ -106,6 +114,7 @@ class ContestPeriod
       start_day = m[3]
       end_day = m[6]
       self.extra_info = m[7]
+      #puts m.inspect
     elsif (m = FORMAT8.match(lwr_date))
       self.is_local = true
       start_hm = m[1]
@@ -151,10 +160,18 @@ class ContestPeriod
       start_day = m[3]
       end_day =  m[6]
       self.extra_info = m[7]                  
+    elsif lwr_date.match(/cancelled/)
+      # handle cancelled contests.
+      start_hm = "0000"
+      end_hm = "0000"
+      start_month = "Jan"
+      end_month = "Jan"
+      start_day = "1"
+      end_day = "1"
     else
       # Cannot parse it
       puts "\n\nCannot parse ""#{lwr_date}""\n\n"
-      raise StandardError.new("Cannot Parse [#{lwr_date}]")
+      raise DateParseError.new("Cannot Parse [#{lwr_date}]")
       return
     end
 
@@ -166,8 +183,8 @@ class ContestPeriod
       return
     end
 
-    start_year = adjusted_year_for_month(start_month)
-    end_year = adjusted_year_for_month(end_month)
+    start_year = self.year # adjusted_year_for_month(start_month)
+    end_year = self.year + (end_month_number < start_month_number ? 1 : 0) #adjusted_year_for_month(end_month)
 
     # make into this format 1985-04-12T23:20:50.52Z to parse with RFC3339 format
     #                       2015-04-07T::00.00Z
@@ -184,7 +201,7 @@ class ContestPeriod
   def start_in_period(start_time, end_time)
     if self.start_time.nil?
       puts "Start time is nil!!!! original period #{self.original_period}"
-      puts self.inspect
+      #puts self.inspect
     end
     (DateTime.parse(start_time) <= self.start_time) && (self.start_time <= DateTime.parse(end_time))
   end
@@ -202,40 +219,43 @@ class ContestPeriod
   # 1300Z-1400Z, Jul 15 and 1900Z-2000Z, Jul 15 and 0300Z-0400Z, Jul 16, 2015
   # 1700Z-1800Z, Jun 4 (CW) and 1800Z-1900Z, Jun 4 (SSB) and  1900Z-2000Z, Jun 4 (FM) and  2000Z-2100Z, Jun 4 (Dig)
   # handle the string, return one or more ContestPeriods
-  def self.interpret_original_period(o_string)
-
+  def self.interpret_original_period(o_string, year)
+    puts("interpret_original_period \"#{o_string}\" #{year}")
     new_string = o_string
     # [0900Z-1200Z and 1300Z-1600Z, Jul 19]
     #matched_times =  o_string.scan(/(#{TIME_RANGE_FORMAT}+\s+and)/)
     matched_times = o_string.scan(FORMAT_AND_1)
     matched_end = o_string.match(FORMAT_END)
+    puts("matched times #{matched_times.inspect} matched end #{matched_end.inspect}")
     if (matched_times && !matched_times.empty?) && matched_end
       accumulated_periods = []
       # handle month and day
       month = matched_end[3]
       day = matched_end[4]
+      puts "MATCHED TIMES #{matched_times.inspect}"
       matched_times.each do |m|
         # ["0900Z-1200Z and", "0900", "1200"]
         single_date = "#{m[1]}Z-#{m[2]}Z, #{month} #{day}"
-        accumulated_periods << self.new(single_date)
+        accumulated_periods << self.new(single_date, year)
         o_string.sub!(m[0],"")
       end
-      accumulated_periods << self.new(o_string)
+      accumulated_periods << self.new(o_string, year)
     else
-      return([self.new(o_string)])
+      return([self.new(o_string, year)])
     end
   end
 
 end
 
 class ContestItemParser
-  attr_reader :doc, :dates, :contest_periods, :logs_due
-  attr_accessor :times
+  attr_reader :doc, :dates, :logs_due, :contest_periods
+  attr_accessor :times, :year
 
-  def initialize(link, times)
+  def initialize(link, year, times)
      # puts "ContentItemParser with #{link}"
      @doc =  Nokogiri::HTML(open(link))
-     self.times = times
+     self.year = year
+     self.times= times
   end
 
   def file=(name)
@@ -245,7 +265,7 @@ class ContestItemParser
     }
     @doc = Nokogiri::HTML(contents)
   end
-
+                                            
   def contest_name
     @doc.css("div#main td")[0].text
   end
@@ -311,20 +331,64 @@ class ContestItemParser
   end
 
   def logs_due_value
+    first_logs_due_value
     lds_el = @doc.css("div#main td:contains('Logs due:')").first
-    #puts lds_el.text
-    lds = lds_el && lds_el.text.gsub(/^.*Logs due:\s*/, "")
-
+    return "see rules" unless lds_el&.previous_sibling
+    td_before = lds_el.previous_sibling
+    puts "LOGSDUEVALUE"
+    puts lds_el.text
+    puts "Previous #{td_before.text}"
+    lds = lds_el && lds_el.text.gsub(/^.*Logs due:\s*\d{4}Z,\s*/, "")
+    puts lds.gsub(/\W*\d{4}Z\-\d{4}Z,\s*/, "")
     (lds && Date.strptime(lds.gsub(/\W*\d{4}Z\-\d{4}Z,\s*/, ""), '%b %d').strftime("%B %-d")) || "see rules"
+  end
+
+  def first_logs_due_value
+    future_dates = @doc.css("div#main td:contains('Future Dates')").first
+    first_due_tr = future_dates.parent
+    contents_tr = first_due_tr.next
+    puts "contents_tr #{contents_tr.inspect}"
+    first_due_td_0 = contents_tr.css('td')[1]
+    first_due_td_1 = contents_tr.css("td:contains('Logs due:')").first
+    puts "first_due 0 #{first_due_td_0}"
+    puts "first_due 1 #{first_due_td_1}"
+
+    lds = first_due_td_1  && first_due_td_1.text.gsub(/^.*Logs due:\s*\d{4}Z,\s*/, "") # "  Logs due: 0000Z, Mar 1" -> "Mar 1"
+    dt = nil
+    if lds && (m=first_due_td_0.text.downcase.match(ContestPeriod::FORMAT10))
+       year = m[3] || Time.zone.now.strftime("%Y")
+       puts "STRPTIME of \"#{lds}, #{year}\""
+       dt = Date.strptime("#{lds}, #{year}","%b %d, %Y")
+    end
+    (dt && dt.strftime("%B %-d")) || "see rules"
+  end
+
+  def repair_multiple_segments(original_times)
+    times = original_times.dup
+    if times.length < 2
+      return times
+    end
+
+    (0..times.length-1).each do |i|
+      if !times[i].nil? && !times[i].downcase.strip.match(/#{ContestPeriod::MONTH_REGEX}/i)
+        puts "fixing #{i} [#{times[i]}] of #{times.length} from #{times.inspect}"
+        times[i] = times[i] + times[i+1] if times[i+1]
+        times[i+1] = nil
+      end
+    end
+    times.compact
   end
 
   def times=(the_time)
     @contest_periods = []
     @times = the_time
-    puts "the_time #{the_time.inspect}"
+    # handle this case  ["0500Z-0800Z and", "  1500Z-1800Z, Dec 1 and", "  0700Z-1000Z, Dec 2"]
+    the_time = repair_multiple_segments(the_time)
+
     @contest_periods = the_time.map{|tv|
-       #ContestPeriod.new(tv)
-      ContestPeriod.interpret_original_period(tv.gsub("June","Jun"))
+      #ContestPeriod.new(tv)
+      #puts "times= Tv is #{tv}"
+      ContestPeriod.interpret_original_period(tv.gsub("June","Jun").downcase, self.year)
     }
 
     @contest_periods.flatten!
@@ -349,19 +413,25 @@ class ContestFragmentParser
   attr_accessor :start_date
   attr_accessor :end_date
 
-  CONTEST_URL_ROOT = 'http://www.contestcalendar.com'
+  CONTEST_URL_ROOT = 'https://www.contestcalendar.com'
+  MONTH_NAMES = "january|february|march|april|may|june|july|august|september|october|november|december"
+  #MONTH_NAMES_ARY = MONTH_NAMES.split(/\|/)
+  MONTH_NAMES_REGEX =  "(#{MONTH_NAMES})"
 
   def initialize(filename)
     if filename.nil?
       filename = "#{CONTEST_URL_ROOT}/contestcal.html"
     end
-    puts "Opening #{filename}"
+
     if filename.downcase.match(/^http/)
+      puts "Opening (HTML) #{filename}"
       @doc = Nokogiri::HTML(open(filename))
       @page_url = filename
     else
+      puts "Opening #{filename}"
       @doc = Nokogiri::HTML(File.read(filename))
     end
+
   end
 
 
@@ -374,24 +444,54 @@ class ContestFragmentParser
     the_el && the_el[:href]
   end
 
+  def is_date(el)
+    # match "January 2020" in text part
+    m = el.text.downcase.match(/(#{MONTH_NAMES_REGEX})\s+(\d{4})/)
+    return nil if m.nil?
+    return m[2], m[3]
+  end
+
   def times(el)
     el.css("td")[1].children.select(&:text?).map{|l| l.text.gsub(/\s* and\s*$/,"")}
   end
 
+  def raw_times(el)
+    el.css("td")[1].children.select(&:text?).map{|l| l.text}
+  end
+
   def get_info
+    link_month = nil
+    link_year = nil
     @contests = []
     contest_links.each{|l|
+      # Handle each individual link on the page, which is interspersed with the dates.
+      #puts "CONTEST LINK #{l}"
+      m, y = is_date(l)
+      if m && y
+        link_month = m
+        link_year = y
+        puts "FOUND A DATE! #{m} #{y}"
+        next
+      end
+
       the_link = link(l)
       next if the_link.nil?
+
       if @page_url
         the_link = URI.join(@page_url,the_link).to_s
       end
-      puts "Opening #{the_link}"
-      some_times = times(l)
-      #puts "TIMES #{some_times.inspect}"
-      ci = ContestItemParser.new(the_link, times(l))
-      #ci.times = times(l)
-      @contests << ci
+
+      #puts("Link ((#{l}))")
+      some_times = raw_times(l)
+
+      puts("\nParsing link: link #{the_link} year #{link_year} some_times #{some_times}")
+      begin
+        ci = ContestItemParser.new(the_link, link_year, some_times)
+        @contests << ci
+      rescue ContestPeriod::DateParseError => ex
+        "Cannot Parse Date for #{the_link}"
+      end
+
     }
     date_order
   end
@@ -447,7 +547,7 @@ class ContestFragmentParser
               doc.text("; ")
               doc.text(contest.modes)
               doc.text("; Bands: ")
-              doc.text(contest.bands)
+               bands_for_print(doc, contest.bands)
               doc.text("; ")
               doc.text(contest.exchange)
               doc.text("; Logs due: ")
@@ -496,7 +596,13 @@ class ContestFragmentParser
                 @by_date[date_key].each { |contest|
                   doc.li {
                     doc.a(:href => contest.rules_link) {
-                      doc.text(contest.contest_name)
+                      if is_arrl_contest?(contest.contest_name)
+                        doc.b {
+                          doc.text(contest.contest_name)
+                        }
+                      else
+                        doc.text(contest.contest_name)
+                      end
                     }
                   }
                 }
@@ -536,7 +642,13 @@ class ContestFragmentParser
             doc.ul {
               doc.li {
                 doc.a(:href => c.rules_link) {
-                  doc.text(c.contest_name)
+                  if is_arrl_contest?(c.contest_name)
+                    doc.b {
+                      doc.text(c.contest_name)
+                    }
+                  else
+                    doc.text(c.contest_name)
+                  end
                 }
               }
             }
@@ -547,6 +659,26 @@ class ContestFragmentParser
     end
   end
 
+  ARRL_CONTEST_REGEX = /^ARRL|North American Sprint|North American QSO|IARU HF World Championship/
+
+  def is_arrl_contest?(contest_name)
+    contest_name.match(ARRL_CONTEST_REGEX)
+  end
+
+  def highlight_vhf(bands)
+    text = bands
+    bands.gsub("6m")
+  end
+
+  def bands_for_print(doc,bands)
+    bands = bands.strip
+    if bands == ""
+      doc.text("(see rules)")
+      return
+    end
+    doc.text(bands)
+  end
+
   def contest_details
     #
     #CWops Mini-CWT Test, June 18 0300z-0400z, June 24 1300Z-1400Z,  June 24 1900Z-2000Z,  June 25 0300Z-0400Z, July 1 1300Z-1400Z, July 1 1900Z-2000Z;
@@ -554,15 +686,20 @@ class ContestFragmentParser
     #
     builder = Nokogiri::HTML::Builder.new do |doc|
       doc.html {
-        doc.body() {
+        doc.body {
           @contests.each { |contest|
+            #puts "CONTEST #{contest.inspect}"
             next unless contest.contest_periods.any?{|cp| cp.start_in_period(self.start_date, self.end_date) }
 
             #contest.fix_log_due_time
 
             doc.span {
               doc.a(:href => contest.rules_link) {
-                doc.text(contest.contest_name)
+                if is_arrl_contest?(contest.contest_name)
+                  doc.b { doc.text(contest.contest_name) }
+                else
+                  doc.text(contest.contest_name)
+                end
               }
               doc.text( ", " )
               doc.text(
@@ -573,7 +710,7 @@ class ContestFragmentParser
               doc.text( "; ")
               doc.text( contest.modes )
               doc.text( "; Bands: ")
-              doc.text(  contest.bands )
+              bands_for_print(doc, contest.bands)
               doc.text( "; " )
               doc.text(contest.exchange)
               doc.text("; Logs due: ")
@@ -598,7 +735,7 @@ class ContestFragmentParser
   # goo.get_info
   # y = goo.contest_details
   # y.to_html
-  # y.contest_summary
+  # y.contest_summary                   
 
 end
 
@@ -631,6 +768,7 @@ class ContestReport
     cfd = ContestFragmentParser.new(input_file)
     cfd.start_date = start_date
     cfd.end_date = end_date
+
     cfd.get_info
     cd = cfd.contest_details
     output_file_details = "#{output_file_root}_details.html"
@@ -652,7 +790,7 @@ end
 class ContestLogsDueParser
   attr_accessor :doc
 
-  CONTEST_URL_ROOT = 'http://www.contestcalendar.com'
+  CONTEST_URL_ROOT = 'https://www.contestcalendar.com'
 
   def initialize(start_date=nil, end_date=nil)
     @start_date = DateTime.parse(start_date) if start_date
